@@ -705,6 +705,20 @@ impl SrtlaTestTopology {
         apply_impairment(&self.sender_ns, iface, config)
     }
 
+    /// Apply the same impairment to both ends of veth link `idx`, so it acts
+    /// in both directions. `impair_link` only shapes the sender's egress; the
+    /// receiver keeps broadcasting SRT ACKs over every uplink, so a one-way
+    /// "blackhole" still delivers inbound bytes. A real outage (tunnel, lift)
+    /// kills both directions — use this to model one.
+    pub fn impair_link_both_ways(&self, idx: usize, config: ImpairmentConfig) -> Result<()> {
+        let r_iface = self
+            .receiver_ifaces
+            .get(idx)
+            .with_context(|| format!("link index {idx} out of range"))?;
+        self.impair_link(idx, config.clone())?;
+        apply_impairment(&self.receiver_ns, r_iface, config)
+    }
+
     /// Write sender IPs to a temp file and return the path.
     pub fn write_ip_list(&self) -> Result<PathBuf> {
         let dir = tempfile::tempdir().context("create temp dir for IP list")?;
@@ -772,6 +786,53 @@ pub fn wait_for_connected_uplinks(
             bail!(
                 "timeout waiting for {min_count} connected uplink(s) to {peer} in ns {} (saw \
                  {count})\nlast ss -uan output:\n{last_ss_output}",
+                ns.name
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Poll `ss -uan` inside `ns` until every source IP in `local_ips` has a UDP
+/// socket bound to it, or one connected to `peer_ip:peer_port`.
+///
+/// Uplink sockets are left unconnected (bound to the source IP, sent with
+/// `send_to`) so replies from a multi-homed or NATed receiver aren't dropped
+/// by the kernel; `ss` therefore shows them as `UNCONN` with no peer, and
+/// [`wait_for_connected_uplinks`] can never see them. A bound socket per
+/// source IP is the readiness signal that matches the current sender.
+pub fn wait_for_uplink_sockets(
+    ns: &Namespace,
+    local_ips: &[String],
+    peer_ip: &str,
+    peer_port: u16,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let peer = format!("{peer_ip}:{peer_port}");
+    let mut last_ss_output;
+
+    loop {
+        let out = ns.exec("ss", &["-uan"])?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ready = local_ips
+            .iter()
+            .filter(|ip| {
+                let local = format!("{ip}:");
+                stdout
+                    .lines()
+                    .any(|line| line.contains(&peer) || line.contains(&local))
+            })
+            .count();
+        if ready >= local_ips.len() {
+            return Ok(());
+        }
+        last_ss_output = stdout.to_string();
+
+        if start.elapsed() > timeout {
+            bail!(
+                "timeout waiting for uplink sockets on {local_ips:?} (peer {peer}) in ns {} \
+                 (saw {ready})\nlast ss -uan output:\n{last_ss_output}",
                 ns.name
             );
         }
@@ -1055,6 +1116,12 @@ impl SrtlaTestStack {
         self.topo.impair_link(idx, config)
     }
 
+    /// Impair link `idx` in both directions (see
+    /// [`SrtlaTestTopology::impair_link_both_ways`]).
+    pub fn impair_link_both_ways(&self, idx: usize, config: ImpairmentConfig) -> Result<()> {
+        self.topo.impair_link_both_ways(idx, config)
+    }
+
     /// The local SRT port that srtla_send listens on (for injecting test data).
     pub fn sender_srt_port(&self) -> u16 {
         SRTLA_SEND_SRT_PORT
@@ -1063,6 +1130,52 @@ impl SrtlaTestStack {
     /// The receiver-side srtla_rec port the sender's uplink sockets connect to.
     pub fn receiver_srtla_port(&self) -> u16 {
         SRTLA_REC_PORT
+    }
+
+    /// Whether srtla_send has logged `connection established (active=N)` with
+    /// `N >= min_active`, i.e. at least that many uplinks finished REG2/REG3.
+    /// Reads the live stdout and stderr captures (tracing's default writer is
+    /// stdout), so it is safe while the stack runs.
+    pub fn sender_has_active_links(&self, min_active: usize) -> bool {
+        let Some(proc) = self.srtla_send.as_ref() else {
+            return false;
+        };
+        let established = |lines: &Vec<String>| {
+            lines.iter().any(|line| {
+                line.split("connection established (active=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(')').next())
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+                    .is_some_and(|n| n >= min_active)
+            })
+        };
+        [&proc.stdout, &proc.stderr]
+            .iter()
+            .any(|buf| buf.lock().is_ok_and(|lines| established(&lines)))
+    }
+
+    /// Number of uplinks srtla_send has logged leaving the Warming phase,
+    /// either via enough RTT probes or the warming timeout. Stall/silence
+    /// logic is meant to be exercised on Live links, so tests of it should
+    /// wait for this to reach the link count before impairing anything.
+    pub fn sender_live_link_count(&self) -> usize {
+        let Some(proc) = self.srtla_send.as_ref() else {
+            return 0;
+        };
+        [&proc.stdout, &proc.stderr]
+            .iter()
+            .map(|buf| {
+                buf.lock().map_or(0, |lines| {
+                    lines
+                        .iter()
+                        .filter(|l| {
+                            l.contains("warming complete, transitioning to Live")
+                                || l.contains("auto-promoting to Live")
+                        })
+                        .count()
+                })
+            })
+            .sum()
     }
 
     /// Stop all processes and collect their output.

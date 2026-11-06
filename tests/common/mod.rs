@@ -4,13 +4,15 @@
 use std::time::Duration;
 
 use network_sim::{
-    SrtlaTestStack, check_impairment_deps, check_integration_deps, wait_for_connected_uplinks,
-    wait_for_udp_listener,
+    SrtlaTestStack, check_impairment_deps, check_integration_deps, wait_for_udp_listener,
+    wait_for_uplink_sockets,
 };
 
 /// Bounded readiness gate replacing a fixed "sleep N seconds for registration".
-/// Returns once srtla_send's local SRT listener is up and its uplink sockets are
-/// connected to the receiver, so callers wait on observed state, not a timer.
+/// Returns once srtla_send's local SRT listener is up, it has an uplink socket
+/// bound to every source IP, and every uplink has finished registration
+/// (`connection established (active=N)`), so callers wait on observed state,
+/// not a timer. Bound sockets alone are not enough: they exist before REG3.
 pub fn wait_until_ready(stack: &SrtlaTestStack) {
     wait_for_udp_listener(
         &stack.topo.sender_ns,
@@ -18,14 +20,24 @@ pub fn wait_until_ready(stack: &SrtlaTestStack) {
         Duration::from_secs(15),
     )
     .expect("srtla_send local SRT listener up");
-    wait_for_connected_uplinks(
+    wait_for_uplink_sockets(
         &stack.topo.sender_ns,
+        &stack.topo.sender_ips,
         &stack.topo.receiver_ip,
         stack.receiver_srtla_port(),
-        stack.topo.sender_ips.len(),
         Duration::from_secs(15),
     )
-    .expect("srtla_send uplink sockets connected to receiver");
+    .expect("srtla_send uplink sockets bound on every source IP");
+
+    let links = stack.topo.sender_ips.len();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !stack.sender_has_active_links(links) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "srtla_send never reported {links} registered uplinks"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Check all integration test dependencies. Returns `true` if tests should
@@ -85,6 +97,30 @@ pub fn inject_stream(
         stack.sender_srt_port(),
         packets_per_sec,
         network_sim::TS_PACKET_BYTES,
+        duration,
+    )
+}
+
+/// Inject a steady UDP stream into the stack's SRT caller (`srt-live-transmit`,
+/// started with `SrtlaTestStack::start_srt_caller`), which wraps it in real SRT
+/// data packets with sequence numbers before srtla_send sees it.
+///
+/// Use this instead of [`inject_stream`] when a test depends on per-link
+/// in-flight accounting (stall latch, silence pull, ACK/NAK attribution): the
+/// raw stream is `0xB8`-filled, which srtla_send parses as SRT *control*
+/// packets, so they carry no sequence number and never count as in flight.
+#[allow(dead_code)]
+pub fn inject_srt_stream(
+    stack: &SrtlaTestStack,
+    packets_per_sec: u32,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    network_sim::inject_udp_stream(
+        &stack.topo.sender_ns,
+        "127.0.0.1",
+        network_sim::SRT_CALLER_INGEST_PORT,
+        packets_per_sec,
+        network_sim::SRT_PAYLOAD_BYTES,
         duration,
     )
 }
