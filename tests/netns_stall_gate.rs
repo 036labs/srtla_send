@@ -34,7 +34,12 @@ fn test_stall_gate_latches_and_rejoins_after_dwell() {
     let mut stack = SrtlaTestStack::start(
         "stall",
         2,
-        &["--stall-ack-stale-ms", STALE_CEILING_MS, "--stall-min-in-flight", "8"],
+        &[
+            "--stall-ack-stale-ms",
+            STALE_CEILING_MS,
+            "--stall-min-in-flight",
+            "8",
+        ],
     )
     .expect("start stack");
     common::wait_until_ready(&stack);
@@ -76,7 +81,8 @@ fn test_stall_gate_latches_and_rejoins_after_dwell() {
 
     // Latch expected after ~1.5 s of proof staleness; 3 s of load leaves
     // margin while keeping the blackhole shorter than CONN_TIMEOUT.
-    common::inject_srt_stream(&stack, 400, Duration::from_secs(3)).expect("stream during blackhole");
+    common::inject_srt_stream(&stack, 400, Duration::from_secs(3))
+        .expect("stream during blackhole");
 
     stack
         .impair_link_both_ways(0, ImpairmentConfig::default())
@@ -84,7 +90,8 @@ fn test_stall_gate_latches_and_rejoins_after_dwell() {
 
     // Rejoin dwell is 2x the effective staleness window (3 s here). Keep the
     // stream up so duplicate probes earn the gated link continuous ACK proof.
-    common::inject_srt_stream(&stack, 400, Duration::from_secs(8)).expect("stream through recovery");
+    common::inject_srt_stream(&stack, 400, Duration::from_secs(8))
+        .expect("stream through recovery");
 
     let output = stack.stop();
     common::dump_output(&output);

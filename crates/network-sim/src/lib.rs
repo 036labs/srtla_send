@@ -18,12 +18,10 @@ pub mod topology;
 
 pub use harness::{
     NamespaceProcess, SRT_CALLER_INGEST_PORT, SRT_PAYLOAD_BYTES, SkipReason, SrtOptions,
-    SrtlaTestStack,
-    SrtlaTestTopology, StackOutput, TS_PACKET_BYTES, build_adaptive_sender,
+    SrtlaTestStack, SrtlaTestTopology, StackOutput, TS_PACKET_BYTES, build_adaptive_sender,
     check_adaptive_sender_deps, check_binary, check_impairment_deps, check_integration_deps,
     inject_udp_packets, inject_udp_stream, read_srt_stats, spawn_udp_stream,
-    wait_for_connected_uplinks,
-    wait_for_udp_listener, wait_for_uplink_sockets,
+    wait_for_connected_uplinks, wait_for_udp_listener, wait_for_uplink_sockets,
 };
 pub use impairment::{GemodelConfig, ImpairmentConfig, apply_impairment};
 pub use scenario::{LinkScenarioConfig, Scenario, ScenarioConfig, ScenarioFrame};

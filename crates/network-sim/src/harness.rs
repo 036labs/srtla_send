@@ -831,8 +831,8 @@ pub fn wait_for_uplink_sockets(
 
         if start.elapsed() > timeout {
             bail!(
-                "timeout waiting for uplink sockets on {local_ips:?} (peer {peer}) in ns {} \
-                 (saw {ready})\nlast ss -uan output:\n{last_ss_output}",
+                "timeout waiting for uplink sockets on {local_ips:?} (peer {peer}) in ns {} (saw \
+                 {ready})\nlast ss -uan output:\n{last_ss_output}",
                 ns.name
             );
         }
@@ -951,7 +951,12 @@ impl SrtlaTestStack {
     ///
     /// `sender_extra_args` are appended to the srtla_send command line.
     pub fn start(test_name: &str, num_links: usize, sender_extra_args: &[&str]) -> Result<Self> {
-        Self::start_with_srt(test_name, num_links, sender_extra_args, SrtOptions::default())
+        Self::start_with_srt(
+            test_name,
+            num_links,
+            sender_extra_args,
+            SrtOptions::default(),
+        )
     }
 
     /// [`Self::start`] with explicit SRT endpoint settings. The options also
