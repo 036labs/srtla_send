@@ -238,6 +238,30 @@ pub fn render(stats: &SharedStats, config: &DynamicConfig, cw: &CriticalWindow) 
         .ok();
     }
 
+    for (name, help, get) in [
+        (
+            "srtla_send_link_rescue_events",
+            "cumulative blackout rescues that found stranded packets on this link",
+            (|l: &crate::stats::LinkStats| l.rescue_events) as fn(&crate::stats::LinkStats) -> u64,
+        ),
+        (
+            "srtla_send_link_rescued_packets",
+            "cumulative packets resent on other links after this link was pulled",
+            |l| l.rescued_packets,
+        ),
+        (
+            "srtla_send_link_rescued_bytes",
+            "cumulative bytes resent on other links after this link was pulled",
+            |l| l.rescued_bytes,
+        ),
+    ] {
+        writeln!(out, "# HELP {name} {help}").ok();
+        writeln!(out, "# TYPE {name} counter").ok();
+        for link in &snap.links {
+            writeln!(out, r#"{name}{{ip="{}"}} {}"#, link.ip, get(link)).ok();
+        }
+    }
+
     writeln!(
         out,
         "# HELP srtla_send_link_weight operator link weight from the ips file, normalised so the \

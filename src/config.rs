@@ -42,6 +42,7 @@ pub struct DynamicConfig {
     /// Learned from the wire rather than configured: see
     /// [`DynamicConfig::set_negotiated_latency_ms`].
     negotiated_latency_ms: Arc<AtomicU32>,
+    blackout_rescue: Arc<AtomicBool>,
 }
 
 impl Default for DynamicConfig {
@@ -61,6 +62,7 @@ impl DynamicConfig {
             conn_timeout_ms: Arc::new(AtomicU64::new(CONN_TIMEOUT_MS)),
             rehome_on_failure: Arc::new(AtomicBool::new(true)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
+            blackout_rescue: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -85,6 +87,7 @@ impl DynamicConfig {
             )),
             rehome_on_failure: Arc::new(AtomicBool::new(!no_rehome)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
+            blackout_rescue: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -109,6 +112,7 @@ impl DynamicConfig {
             stall_ack_stale_ms: self.stall_ack_stale_ms.load(Ordering::Relaxed),
             conn_timeout_ms: self.conn_timeout_ms.load(Ordering::Relaxed),
             negotiated_latency_ms: self.negotiated_latency_ms.load(Ordering::Relaxed),
+            blackout_rescue: self.blackout_rescue.load(Ordering::Relaxed),
         }
     }
 
@@ -141,6 +145,17 @@ impl DynamicConfig {
     /// Set whether quality scoring is enabled.
     pub fn set_quality_enabled(&self, enabled: bool) {
         self.quality_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Builder for the startup value of blackout rescue (`--blackout-rescue`).
+    pub fn with_blackout_rescue(self, enabled: bool) -> Self {
+        self.set_blackout_rescue(enabled);
+        self
+    }
+
+    /// Toggle blackout rescue at runtime.
+    pub fn set_blackout_rescue(&self, enabled: bool) {
+        self.blackout_rescue.store(enabled, Ordering::Relaxed);
     }
 
     /// Toggle the stalled-link deselect guard at runtime.

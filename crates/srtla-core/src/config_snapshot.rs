@@ -147,6 +147,12 @@ pub struct ConfigSnapshot {
     /// that runs without TSBPD), in which case consumers fall back to
     /// estimating a budget from their own RTT samples.
     pub negotiated_latency_ms: u32,
+    /// Blackout rescue (default OFF until measured in the field). On, the shell
+    /// keeps a short ring of each link's recent data packets and, the moment
+    /// the stall gate pulls a link, resends that link's still-unacknowledged
+    /// packets on the healthy links instead of waiting for the SRT receiver to
+    /// NAK them. Off, nothing is recorded and behaviour is unchanged.
+    pub blackout_rescue: bool,
 }
 
 impl Default for ConfigSnapshot {
@@ -159,6 +165,7 @@ impl Default for ConfigSnapshot {
             stall_ack_stale_ms: STALL_ACK_STALE_MS,
             conn_timeout_ms: CONN_TIMEOUT_MS,
             negotiated_latency_ms: 0,
+            blackout_rescue: false,
         }
     }
 }

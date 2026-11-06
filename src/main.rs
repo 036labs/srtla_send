@@ -87,6 +87,15 @@ struct Cli {
     /// rejoin dwell (quick to drop, conservative to rejoin).
     #[arg(long = "no-stall-deselect")]
     no_stall_deselect: bool,
+    /// Enable blackout rescue (off by default until field-measured). Each
+    /// link keeps a short ring of its recent data packets; the moment the
+    /// stall gate pulls a link (total silence under load, or a latched stall),
+    /// its still-unacknowledged packets are resent on the healthy links with
+    /// the retransmit flag, instead of waiting a round trip for the SRT
+    /// receiver to NAK them. Receivers discard any copy they already have.
+    /// Requires the stall gate (`--no-stall-deselect` disables both).
+    #[arg(long = "blackout-rescue")]
+    blackout_rescue: bool,
     /// In-flight packet backlog at or above which a link becomes a stall
     /// candidate for `--no-stall-deselect`.
     #[arg(long = "stall-min-in-flight", default_value_t = config::STALL_MIN_IN_FLIGHT_PACKETS)]
@@ -154,6 +163,7 @@ impl Cli {
             mode,
             no_quality,
             no_stall_deselect,
+            blackout_rescue,
             stall_min_in_flight,
             stall_ack_stale_ms,
             conn_timeout_ms,
@@ -209,7 +219,8 @@ async fn main() -> Result<()> {
         args.stall_ack_stale_ms,
         args.conn_timeout_ms,
         args.no_rehome,
-    );
+    )
+    .with_blackout_rescue(args.blackout_rescue);
 
     // Create shared stats for telemetry export
     let shared_stats = stats::SharedStats::new();
@@ -301,6 +312,7 @@ mod tests {
                 mode = "classic"
                 no_quality = true
                 no_stall_deselect = true
+                blackout_rescue = true
                 stall_min_in_flight = 64
                 stall_ack_stale_ms = 1500
                 conn_timeout_ms = 8000
@@ -309,6 +321,7 @@ mod tests {
         assert_eq!(cli.mode, SchedulingMode::Classic);
         assert!(cli.no_quality);
         assert!(cli.no_stall_deselect);
+        assert!(cli.blackout_rescue);
         assert_eq!(cli.stall_min_in_flight, 64);
         assert_eq!(cli.stall_ack_stale_ms, 1500);
         assert_eq!(cli.conn_timeout_ms, 8000);

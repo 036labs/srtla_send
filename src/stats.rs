@@ -166,6 +166,12 @@ pub struct LinkStats {
     /// HARQ stalls — rate telemetry, not an alarm; compare against
     /// `stall_gate_events` to tell micro-stalls from real black holes.
     pub silence_pulls: u64,
+    /// Blackout rescue (`--blackout-rescue`): cumulative rescues that found
+    /// stranded packets on this link, and the packets / bytes resent on the
+    /// other links on its behalf. Zero while the feature is off.
+    pub rescue_events: u64,
+    pub rescued_packets: u64,
+    pub rescued_bytes: u64,
     /// Whether this link is the elected sole carrier: every schedulable link
     /// is quality-gated, and this is the one still carrying the payload.
     pub sole_carrier: bool,
@@ -386,6 +392,9 @@ impl SharedStats {
                 stall_gated: conn.stall_latched(),
                 stall_gate_events: conn.stall_gate_events(),
                 silence_pulls: conn.silence_pulls(),
+                rescue_events: conn.rescue_events(),
+                rescued_packets: conn.rescued_packets(),
+                rescued_bytes: conn.rescued_bytes(),
                 weight: conn.link_weight,
                 sole_carrier: conn.is_sole_carrier(),
                 sole_carrier_excluded: conn.is_sole_carrier_excluded(),

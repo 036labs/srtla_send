@@ -56,6 +56,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
         sole_carrier_elections: 0,
         silence_pulled: false,
         silence_pulls: 0,
+        rescue: crate::connection::RescueRing::default(),
         conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
         delay_budget_ms: 0,
         rtt: RttTracker::default(),

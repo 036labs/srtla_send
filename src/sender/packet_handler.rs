@@ -394,6 +394,11 @@ pub async fn handle_srt_packet(
                     packet_time_ms,
                 )
                 .await;
+                if config_snap.blackout_rescue
+                    && let Some(s) = seq
+                {
+                    connections[sel_idx].record_for_rescue(s, pkt, packet_time_ms);
+                }
                 if let Some(probe_seq) = seq {
                     send_stall_probes(
                         sel_idx,
@@ -402,6 +407,16 @@ pub async fn handle_srt_packet(
                         connections,
                         conn_io,
                         seq_tracker,
+                        packet_time_ms,
+                    )
+                    .await;
+                }
+                if config_snap.blackout_rescue {
+                    rescue_stalled_links(
+                        connections,
+                        conn_io,
+                        seq_tracker,
+                        config_snap,
                         packet_time_ms,
                     )
                     .await;
@@ -545,6 +560,83 @@ async fn send_stall_probes(
         if needs_flush && let Some(io) = conn_io.get(&conn.conn_id) {
             flush_connection(conn, &io.socket, seq_tracker, "probe batch flush").await;
         }
+    }
+}
+
+/// Blackout rescue: resend a just-pulled link's stranded packets on the healthy
+/// links.
+///
+/// The stall gate arms a rescue on its rising edges (see
+/// `SrtlaConnection::request_rescue`); this runs right after selection, which
+/// is where the gate is evaluated, so a stranded packet is resent within the
+/// same packet event that pulled its link. Each copy keeps its SRT sequence
+/// number and gets the retransmit flag, like a duplicate probe: a receiver
+/// that already has it discards it, one that does not slots it in, and the
+/// flag keeps it out of an SRTLA receiver's reorder-hold estimator.
+///
+/// Unlike a probe, a rescued copy *is* the unique copy the receiver is now
+/// waiting for, so it is tracked like payload on the link that carries it: it
+/// is registered in-flight there, `seq_tracker` hands NAK ownership to that
+/// link, and it is recorded in that link's ring so a second blackout can
+/// rescue it again. The pulled link's own packet-log entries are left alone
+/// for the cumulative ACK to clear, so its stall accounting is unchanged.
+///
+/// Targets come from the normal selector, one packet at a time: it already
+/// skips gated links and counts queued packets against a link's score, so a
+/// rescue burst spreads over the survivors instead of landing on one.
+async fn rescue_stalled_links(
+    connections: &mut [SrtlaConnection],
+    conn_io: &ConnIoMap,
+    seq_tracker: &mut SequenceTracker,
+    config_snap: &ConfigSnapshot,
+    now_ms: u64,
+) {
+    for i in 0..connections.len() {
+        if !connections[i].rescue_pending() {
+            continue;
+        }
+        // Packets still in this link's batch queue are not in its packet log
+        // yet; flush them (into the hole) so they register and get rescued too.
+        if let Some(io) = conn_io.get(&connections[i].conn_id) {
+            flush_connection(&mut connections[i], &io.socket, seq_tracker, "pre-rescue flush")
+                .await;
+        }
+        let max_age_ms = match config_snap.negotiated_latency_ms {
+            0 => srtla_core::connection::RESCUE_DEFAULT_MAX_AGE_MS,
+            ms => ms as u64,
+        };
+        let stranded = connections[i].take_rescue(now_ms, max_age_ms);
+        if stranded.is_empty() {
+            continue;
+        }
+        let total = stranded.len();
+        let (mut sent, mut bytes) = (0u64, 0u64);
+        for (seq, data) in stranded {
+            let Some(t) = select_connection_idx(connections, None, now_ms, config_snap) else {
+                break;
+            };
+            if t == i {
+                // The link un-gated mid-rescue (it spoke): its packets may yet
+                // arrive, and nothing better is available. Stop here.
+                break;
+            }
+            let mut copy: SmallVec<u8, 1500> = SmallVec::from_slice_copy(&data);
+            srtla_protocol::set_srt_data_retransmit(&mut copy);
+            let target = &mut connections[t];
+            let needs_flush = target.queue_data_packet(&copy, Some(seq), now_ms);
+            target.record_for_rescue(seq, &copy, now_ms);
+            seq_tracker.insert(seq, target.conn_id, now_ms);
+            if needs_flush && let Some(io) = conn_io.get(&target.conn_id) {
+                flush_connection(target, &io.socket, seq_tracker, "rescue batch flush").await;
+            }
+            sent += 1;
+            bytes += copy.len() as u64;
+        }
+        connections[i].note_rescued(sent, bytes);
+        info!(
+            "{}: blackout rescue resent {sent}/{total} stranded packets ({bytes} bytes) on healthy links",
+            connections[i].label
+        );
     }
 }
 
@@ -719,5 +811,125 @@ mod tests {
         assert!(connections[0].connected);
         assert!(connections[0].last_sent.is_some());
         assert_eq!(seq_tracker.get(7, now), Some(conn_id));
+    }
+
+    // --- Blackout rescue ---
+
+    /// A minimal SRT data packet: sequence number in the first word (MSB
+    /// clear = data), payload filled with the sequence's low byte.
+    fn srt_data(seq: u32) -> Vec<u8> {
+        let mut p = vec![seq as u8; 1316];
+        p[..4].copy_from_slice(&seq.to_be_bytes());
+        p[4..8].copy_from_slice(&[0; 4]);
+        p
+    }
+
+    fn rescue_config() -> ConfigSnapshot {
+        ConfigSnapshot {
+            blackout_rescue: true,
+            ..ConfigSnapshot::default()
+        }
+    }
+
+    /// Link 0 is loaded and goes silent; link 1 is healthy. The silence pull
+    /// must arm a rescue, and the rescue must move every stranded packet onto
+    /// link 1 as a retransmit-flagged copy that link 1 now owns.
+    #[tokio::test]
+    async fn silence_pull_rescues_stranded_packets_onto_the_healthy_link() {
+        use srtla_core::config_snapshot::STALL_MIN_IN_FLIGHT_PACKETS;
+
+        let mut connections = crate::test_helpers::create_test_connections(2).await;
+        let conn_io = crate::test_helpers::create_test_conn_io_map(&connections);
+        let mut seq_tracker = SequenceTracker::new();
+        let config = rescue_config();
+        let now = srtla_core::utils::now_ms();
+        let n = STALL_MIN_IN_FLIGHT_PACKETS as u32 + 8;
+
+        for seq in 1..=n {
+            connections[0].record_for_rescue(seq, &srt_data(seq), now - 100);
+            connections[0].register_packet(seq as i32, now - 100);
+            seq_tracker.insert(seq, connections[0].conn_id, now - 100);
+        }
+        // Delivery proof fresh (so only the fast tier is in play), but nothing
+        // heard for longer than the pull window.
+        connections[0].last_ack_or_rtt_sample_ms = now;
+        connections[0].last_received = Some(now - 300);
+        connections[1].last_ack_or_rtt_sample_ms = now;
+
+        let sel = select_connection_idx(&mut connections, None, now, &config);
+        assert_eq!(sel, Some(1));
+        assert!(connections[0].rescue_pending(), "the pull must arm a rescue");
+
+        rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
+
+        assert!(!connections[0].rescue_pending());
+        assert_eq!(connections[0].rescue_events(), 1);
+        assert_eq!(connections[0].rescued_packets(), n as u64);
+        assert_eq!(connections[0].rescued_bytes(), n as u64 * 1316);
+        assert_eq!(connections[0].rescue_ring_len(), 0);
+        assert_eq!(
+            connections[0].in_flight_packets,
+            n as i32,
+            "the pulled link's own accounting is left for the cumulative ACK"
+        );
+        let healthy_id = connections[1].conn_id;
+        for seq in 1..=n {
+            assert_eq!(
+                seq_tracker.get(seq, now),
+                Some(healthy_id),
+                "NAK ownership of a rescued packet moves to the carrying link"
+            );
+        }
+
+        // On the wire, link 1 now carries the copies as tracked payload.
+        flush_all_batches(&mut connections, &conn_io, &mut seq_tracker).await;
+        assert_eq!(connections[1].in_flight_packets, n as i32);
+        assert_eq!(connections[1].rescue_ring_len(), n as usize);
+        let again = connections[1].take_rescue(now, 1_000);
+        assert_eq!(again.len(), n as usize);
+        for (seq, data) in &again {
+            assert!(
+                srtla_protocol::is_srt_data_retransmit(data),
+                "a rescued copy must carry the retransmit flag"
+            );
+            assert_eq!(srtla_protocol::get_srt_sequence_number(data), Some(*seq));
+        }
+    }
+
+    /// With every link stalled there is nowhere to rescue to: the gate's
+    /// any-healthy guard keeps the link schedulable, and the rescue must not
+    /// resend a link's packets onto itself.
+    #[tokio::test]
+    async fn rescue_never_resends_onto_the_pulled_link_itself() {
+        use srtla_core::config_snapshot::STALL_MIN_IN_FLIGHT_PACKETS;
+
+        let mut connections = crate::test_helpers::create_test_connections(1).await;
+        let conn_io = crate::test_helpers::create_test_conn_io_map(&connections);
+        let mut seq_tracker = SequenceTracker::new();
+        let config = rescue_config();
+        let now = srtla_core::utils::now_ms();
+        for seq in 1..=(STALL_MIN_IN_FLIGHT_PACKETS as u32) {
+            connections[0].record_for_rescue(seq, &srt_data(seq), now);
+            connections[0].register_packet(seq as i32, now);
+        }
+        connections[0].last_ack_or_rtt_sample_ms = now;
+        connections[0].last_received = Some(now - 300);
+
+        let _ = select_connection_idx(&mut connections, None, now, &config);
+        rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
+
+        assert_eq!(connections[0].rescued_packets(), 0);
+        assert!(!connections[0].has_queued_packets());
+    }
+
+    /// Off by default: a packet event records nothing, so the gate has nothing
+    /// to arm and behaviour is unchanged.
+    #[tokio::test]
+    async fn rescue_is_inert_when_the_flag_is_off() {
+        assert!(!ConfigSnapshot::default().blackout_rescue);
+        let mut c = create_test_connection().await;
+        c.register_packet(1, 0);
+        assert_eq!(c.rescue_ring_len(), 0);
+        assert!(!c.rescue_pending());
     }
 }

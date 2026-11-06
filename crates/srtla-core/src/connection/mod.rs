@@ -4,6 +4,7 @@ mod bitrate;
 mod congestion;
 mod incoming;
 mod reconnection;
+mod rescue;
 mod rtt;
 
 use std::net::IpAddr;
@@ -13,6 +14,10 @@ pub use bitrate::BitrateTracker;
 pub use congestion::CongestionControl;
 pub use incoming::SrtlaIncoming;
 pub use reconnection::ReconnectionState;
+pub use rescue::{
+    RESCUE_DEFAULT_MAX_AGE_MS, RESCUE_MAX_PACKETS_PER_EVENT, RESCUE_RING_MAX_AGE_MS,
+    RESCUE_RING_MAX_PACKETS, RescuePacket, RescueRing,
+};
 pub use rtt::RttTracker;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -433,6 +438,10 @@ pub struct SrtlaConnection {
     /// Cumulative silence-pull engagements (rising edges). Expected to tick
     /// on routine cellular HARQ stalls; a high rate is telemetry, not alarm.
     pub(crate) silence_pulls: u64,
+    /// Blackout rescue: recent data packets kept for resending elsewhere if
+    /// this link stalls, the pending-rescue trigger, and counters. Empty unless
+    /// the shell records into it (`--blackout-rescue`). See [`rescue`].
+    pub(crate) rescue: RescueRing,
     /// Per-link liveness timeout in ms. Refreshed from the config snapshot on
     /// every selection pass so `is_timed_out` (called from paths that do not
     /// carry a config) always sees the current runtime value.
@@ -547,6 +556,7 @@ impl SrtlaConnection {
             sole_carrier_elections: 0,
             silence_pulled: false,
             silence_pulls: 0,
+            rescue: RescueRing::default(),
             conn_timeout_ms: crate::config_snapshot::CONN_TIMEOUT_MS,
             delay_budget_ms: 0,
             rtt: RttTracker::default(),
@@ -996,6 +1006,10 @@ impl SrtlaConnection {
                 );
                 self.stall_latched_since_ms = now_ms;
                 self.stall_gate_events += 1;
+                // Usually a no-op: the silence pull that precedes most
+                // latches already took the ring. This catches a latch that
+                // engages on its own (in-flight stall without total silence).
+                self.request_rescue();
             }
             self.stall_recovery_since_ms = 0;
             return;
@@ -1253,6 +1267,7 @@ impl SrtlaConnection {
             if !self.silence_pulled {
                 self.silence_pulls += 1;
                 debug!("{}: silence pull engaged", self.label);
+                self.request_rescue();
             }
             self.silence_pulled = true;
             return;
@@ -1386,6 +1401,9 @@ impl SrtlaConnection {
         // `silence_pulls` survives like `stall_gate_events`: both count
         // engagements over the link's life.
         self.silence_pulled = false;
+        // A reset link's packet log is gone, so nothing in the ring can be
+        // matched as outstanding any more. The rescue counters survive.
+        self.clear_rescue();
     }
 
     /// Mark connection for recovery (C-style), similar to setting last_rcvd = 1.

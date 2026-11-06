@@ -73,6 +73,7 @@ impl SrtlaConnection {
         let ack_send_time_ms = self.packet_log.get(&ack).copied();
 
         self.highest_acked_seq = ack;
+        self.prune_rescue(ack);
 
         // Clear the newly-ACKed range (old_highest, ack]. Walking the range is
         // cheaper than sweeping the log while ACKs arrive in order; a large gap
