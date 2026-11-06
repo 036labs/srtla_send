@@ -151,7 +151,8 @@ impl DynamicConfig {
         self.quality_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Builder for the startup value of blackout rescue (`--blackout-rescue`).
+    /// Builder for the startup value of blackout rescue (on unless
+    /// `--no-blackout-rescue`).
     pub fn with_blackout_rescue(self, enabled: bool) -> Self {
         self.set_blackout_rescue(enabled);
         self

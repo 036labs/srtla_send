@@ -944,6 +944,31 @@ impl SrtlaConnection {
             .min(ceiling_ms)
     }
 
+    /// Round trip the rejoin timeliness check judges a latched link by: the
+    /// lower of the smoothed RTT and the minimum over the last few seconds.
+    ///
+    /// The smoothed RTT alone is the wrong witness here. A receiver that
+    /// batches SRTLA ACKs (BELABOX's acknowledges every 10 packets per link)
+    /// holds the ACK for a packet that landed just before an outage until
+    /// traffic resumes, and for a latched link's sparse probes until ten have
+    /// arrived, so those samples come back as long as the outage or the batch.
+    /// One of them drags the smoothed RTT up for seconds, and the harness
+    /// caught a link with an 80 ms path held out for 10.9 s after a 1.5 s
+    /// blackout because its smoothed RTT sat at 770 ms. The windowed minimum
+    /// is immune: the sample that completes each batch is acknowledged at
+    /// once, so the floor stays at the path's real round trip. A link that is
+    /// genuinely late has no fast samples, its floor stays high, and it stays
+    /// out.
+    #[inline]
+    pub fn rejoin_rtt_ms(&self) -> f64 {
+        let smooth = self.get_smooth_rtt_ms();
+        if self.rtt.kalman_rtt.is_initialized() && self.rtt.rtt_min_fast_ms > 0.0 {
+            smooth.min(self.rtt.rtt_min_fast_ms)
+        } else {
+            smooth
+        }
+    }
+
     /// `stall_deselect` signal (pure read; never mutates). True for a connected
     /// link whose in-flight backlog is at or above `min_in_flight` AND whose
     /// last delivery proof (earned-ACK or keepalive-RTT sample) is older than
@@ -1028,7 +1053,7 @@ impl SrtlaConnection {
         // proof that a packet of real payload could have ridden.
         let proof_fresh = self.last_ack_or_rtt_sample_ms != 0
             && now_ms.saturating_sub(self.last_ack_or_rtt_sample_ms) < proof_window_ms
-            && delivery_proof_is_timely(self.get_smooth_rtt_ms(), self.delay_budget_ms);
+            && delivery_proof_is_timely(self.rejoin_rtt_ms(), self.delay_budget_ms);
         if !proof_fresh {
             self.stall_recovery_since_ms = 0;
             return;

@@ -147,7 +147,9 @@ pub struct ConfigSnapshot {
     /// that runs without TSBPD), in which case consumers fall back to
     /// estimating a budget from their own RTT samples.
     pub negotiated_latency_ms: u32,
-    /// Blackout rescue (default OFF until measured in the field). On, the shell
+    /// Blackout rescue. Off in this snapshot's default, which library callers
+    /// and tests start from; the `srtla_send` binary turns it on unless
+    /// `--no-blackout-rescue` is given. On, the shell
     /// keeps a short ring of each link's recent data packets and, the moment
     /// the stall gate pulls a link, resends that link's still-unacknowledged
     /// packets on the healthy links instead of waiting for the SRT receiver to

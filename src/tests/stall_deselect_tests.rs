@@ -450,9 +450,12 @@ mod tests {
     // --- Timeliness of the proof itself (librist !375, 6ed9d2a3: delivery on a
     // leg queued deeper than the receiver's buffer is not evidence of anything) ---
 
+    /// Feed the link `rtt_ms` round trips until its estimators settle there:
+    /// the smoothed RTT and the recent minimum alike, as real samples would.
     fn set_rtt(conn: &mut srtla_core::connection::SrtlaConnection, rtt_ms: f64) {
-        for _ in 0..16 {
-            conn.rtt.kalman_rtt.update(rtt_ms);
+        let t0 = now_ms();
+        for i in 0..16 {
+            conn.rtt.update_estimate(rtt_ms as u64, t0 + i);
         }
         assert!(
             (conn.get_smooth_rtt_ms() - rtt_ms).abs() < rtt_ms * 0.1,
@@ -618,6 +621,31 @@ mod tests {
             }
         }
         panic!("a recovered link must rejoin once its proof is timely again");
+    }
+
+    #[test]
+    fn one_batch_delayed_ack_does_not_hold_a_recovered_link_out() {
+        // An 80 ms path, then one SRTLA ACK the receiver held through a 1.5 s
+        // outage: the smoothed RTT jumps far past a 260 ms budget while the
+        // path itself is fine. The rejoin check must judge the path's recent
+        // floor, not the polluted average.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut conns = rt.block_on(create_test_connections(1));
+        let t0 = now_ms();
+        for i in 0..16 {
+            conns[0].rtt.update_estimate(80, t0 + i * 100);
+        }
+        conns[0].rtt.update_estimate(1_500, t0 + 1_700);
+        assert!(
+            conns[0].get_smooth_rtt_ms() / 2.0 > 260.0,
+            "the smoothed RTT must be inflated for this test to mean anything"
+        );
+        let rtt = conns[0].rejoin_rtt_ms();
+        assert!(
+            rtt <= 80.0 + 1.0,
+            "rejoin judged on {rtt} ms, not the 80 ms floor"
+        );
+        assert!(srtla_core::connection::delivery_proof_is_timely(rtt, 260));
     }
 
     #[test]

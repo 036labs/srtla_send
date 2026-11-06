@@ -87,15 +87,15 @@ struct Cli {
     /// rejoin dwell (quick to drop, conservative to rejoin).
     #[arg(long = "no-stall-deselect")]
     no_stall_deselect: bool,
-    /// Enable blackout rescue (off by default until field-measured). Each
-    /// link keeps a short ring of its recent data packets; the moment the
-    /// stall gate pulls a link (total silence under load, or a latched stall),
-    /// its still-unacknowledged packets are resent on the healthy links with
-    /// the retransmit flag, instead of waiting a round trip for the SRT
-    /// receiver to NAK them. Receivers discard any copy they already have.
-    /// Requires the stall gate (`--no-stall-deselect` disables both).
-    #[arg(long = "blackout-rescue")]
-    blackout_rescue: bool,
+    /// Disable blackout rescue (on by default). Each link keeps a short ring
+    /// of its recent data packets; the moment the stall gate pulls a link
+    /// (total silence under load, or a latched stall), its still-unacknowledged
+    /// packets are resent on the healthy links with the retransmit flag,
+    /// instead of waiting a round trip for the SRT receiver to NAK them.
+    /// Receivers discard any copy they already have. Requires the stall gate
+    /// (`--no-stall-deselect` disables both).
+    #[arg(long = "no-blackout-rescue")]
+    no_blackout_rescue: bool,
     /// Pace blackout rescue: resend at most this many stranded packets per
     /// routed data packet (so 1 adds at most the stream's own rate on top of
     /// it), instead of all at once. 0 (default) sends the rescue at once.
@@ -169,7 +169,7 @@ impl Cli {
             mode,
             no_quality,
             no_stall_deselect,
-            blackout_rescue,
+            no_blackout_rescue,
             blackout_rescue_pace,
             stall_min_in_flight,
             stall_ack_stale_ms,
@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
         args.conn_timeout_ms,
         args.no_rehome,
     )
-    .with_blackout_rescue(args.blackout_rescue)
+    .with_blackout_rescue(!args.no_blackout_rescue)
     .with_blackout_rescue_pace(args.blackout_rescue_pace);
 
     // Create shared stats for telemetry export
@@ -320,7 +320,7 @@ mod tests {
                 mode = "classic"
                 no_quality = true
                 no_stall_deselect = true
-                blackout_rescue = true
+                no_blackout_rescue = true
                 blackout_rescue_pace = 2
                 stall_min_in_flight = 64
                 stall_ack_stale_ms = 1500
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(cli.mode, SchedulingMode::Classic);
         assert!(cli.no_quality);
         assert!(cli.no_stall_deselect);
-        assert!(cli.blackout_rescue);
+        assert!(cli.no_blackout_rescue);
         assert_eq!(cli.blackout_rescue_pace, 2);
         assert_eq!(cli.stall_min_in_flight, 64);
         assert_eq!(cli.stall_ack_stale_ms, 1500);

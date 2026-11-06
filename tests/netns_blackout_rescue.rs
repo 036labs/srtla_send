@@ -1,11 +1,11 @@
 //! Blackout-rescue A/B measurement over a real bond.
 //!
-//! Runs the same scripted outage once per arm (baseline without rescue,
-//! rescue sent at once, rescue paced with `--blackout-rescue-pace`) and
-//! reports what the SRT receiver experienced in each. Two
-//! links with a realistic round trip each, a tight SRT latency, a steady
-//! stream through a real SRT caller, and a train of two-way blackouts that
-//! alternate between the links (a tunnel takes one modem at a time).
+//! Runs the same scripted outage once per arm (baseline with
+//! `--no-blackout-rescue`, rescue sent at once, rescue paced with
+//! `--blackout-rescue-pace`) and reports what the SRT receiver experienced in
+//! each. Two links with a realistic round trip each, a tight SRT latency, a
+//! steady stream through a real SRT caller, and a train of two-way blackouts
+//! that alternate between the links (a tunnel takes one modem at a time).
 //!
 //! The headline number is the receiver's `packetsDropped`: packets that never
 //! arrived before their TSBPD deadline, i.e. visible glitches. SRT's own ARQ
@@ -71,8 +71,9 @@ fn run_arm(arm: &str, p: &Params) -> Value {
     // so the silence pull can arm at this packet rate. Identical in every arm.
     let pace = p.pace.to_string();
     let mut args = vec!["--stall-min-in-flight", "8"];
-    if arm != "baseline" {
-        args.push("--blackout-rescue");
+    // Rescue is on by default; the baseline arm turns it off.
+    if arm == "baseline" {
+        args.push("--no-blackout-rescue");
     }
     if arm == "paced" {
         args.extend(["--blackout-rescue-pace", pace.as_str()]);
