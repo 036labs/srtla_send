@@ -153,6 +153,9 @@ pub struct ConfigSnapshot {
     /// packets on the healthy links instead of waiting for the SRT receiver to
     /// NAK them. Off, nothing is recorded and behaviour is unchanged.
     pub blackout_rescue: bool,
+    /// Blackout-rescue pacing: stranded packets resent per routed data packet
+    /// while a rescue drains. `0` resends the whole rescue at once.
+    pub blackout_rescue_pace: u32,
 }
 
 impl Default for ConfigSnapshot {
@@ -166,6 +169,7 @@ impl Default for ConfigSnapshot {
             conn_timeout_ms: CONN_TIMEOUT_MS,
             negotiated_latency_ms: 0,
             blackout_rescue: false,
+            blackout_rescue_pace: 0,
         }
     }
 }

@@ -16,7 +16,7 @@ pub use incoming::SrtlaIncoming;
 pub use reconnection::ReconnectionState;
 pub use rescue::{
     RESCUE_DEFAULT_MAX_AGE_MS, RESCUE_MAX_PACKETS_PER_EVENT, RESCUE_RING_MAX_AGE_MS,
-    RESCUE_RING_MAX_PACKETS, RescuePacket, RescueRing,
+    RESCUE_RING_MAX_PACKETS, RescuePacket, RescueRing, RescueTally,
 };
 pub use rtt::RttTracker;
 use rustc_hash::FxHashMap;

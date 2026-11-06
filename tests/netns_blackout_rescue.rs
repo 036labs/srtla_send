@@ -1,7 +1,8 @@
 //! Blackout-rescue A/B measurement over a real bond.
 //!
-//! Runs the same scripted outage twice, once with `--blackout-rescue` and once
-//! without, and reports what the SRT receiver experienced in each arm. Two
+//! Runs the same scripted outage once per arm (baseline without rescue,
+//! rescue sent at once, rescue paced with `--blackout-rescue-pace`) and
+//! reports what the SRT receiver experienced in each. Two
 //! links with a realistic round trip each, a tight SRT latency, a steady
 //! stream through a real SRT caller, and a train of two-way blackouts that
 //! alternate between the links (a tunnel takes one modem at a time).
@@ -15,13 +16,15 @@
 //! This is a measurement, not a pass/fail gate on the benefit: whether rescue
 //! beats SRT's ARQ depends on the receiver's NAK timing, the RTT and the
 //! latency budget, which is exactly what the numbers are for. It asserts only
-//! that both arms ran and that the rescue fired in its arm and not the other.
+//! that every arm ran and that the rescue fired in the rescue arms only.
 //! The table goes to stderr (`--nocapture`), and a JSON summary to
-//! `$BR_SUMMARY` (default `/tmp/blackout_rescue_summary.json`).
+//! `$BR_SUMMARY` (default `/tmp/blackout_rescue_summary.json`). Each arm's
+//! SRT stats and sender log stay in `/tmp/brsc_{off,on,pac}_srt/`.
 //!
 //! Tunables (env): `BR_LATENCY_MS` (default 400), `BR_DELAY_MS` one-way delay
 //! per link (40, so an 80 ms RTT), `BR_CYCLES` (4), `BR_BLACKOUT_MS` (1500),
-//! `BR_RECOVER_MS` (6000), `BR_PPS` (400).
+//! `BR_RECOVER_MS` (6000), `BR_PPS` (400), `BR_PACE` for the paced arm (1),
+//! `BR_ARMS` to pick arms (`baseline,rescue,paced`).
 
 mod common;
 
@@ -51,18 +54,28 @@ struct Params {
     blackout_ms: u64,
     recover_ms: u64,
     pps: u32,
+    pace: u32,
 }
 
 /// One arm: stand up the stack, run the outage train, return the summary.
-fn run_arm(rescue: bool, p: &Params) -> Value {
-    let name = if rescue { "brsc_on" } else { "brsc_off" };
+/// `arm` is `baseline`, `rescue` or `paced`.
+fn run_arm(arm: &str, p: &Params) -> Value {
+    let name = match arm {
+        "baseline" => "brsc_off",
+        "rescue" => "brsc_on",
+        _ => "brsc_pac",
+    };
     let stats_dir = PathBuf::from(format!("/tmp/{name}_srt"));
 
     // Same stall tuning as the stall-gate test: the in-flight floor is lowered
-    // so the silence pull can arm at this packet rate. Identical in both arms.
+    // so the silence pull can arm at this packet rate. Identical in every arm.
+    let pace = p.pace.to_string();
     let mut args = vec!["--stall-min-in-flight", "8"];
-    if rescue {
+    if arm != "baseline" {
         args.push("--blackout-rescue");
+    }
+    if arm == "paced" {
+        args.extend(["--blackout-rescue-pace", pace.as_str()]);
     }
     let mut stack = SrtlaTestStack::start_with_srt(
         name,
@@ -70,7 +83,7 @@ fn run_arm(rescue: bool, p: &Params) -> Value {
         &args,
         SrtOptions {
             latency_ms: p.latency_ms,
-            stats_dir: Some(stats_dir),
+            stats_dir: Some(stats_dir.clone()),
         },
     )
     .expect("start stack");
@@ -146,6 +159,8 @@ fn run_arm(rescue: bool, p: &Params) -> Value {
         .chain(output.srtla_send_stderr.iter())
         .cloned()
         .collect();
+    // Keep the sender's log beside the SRT stats, for digging into a run.
+    let _ = std::fs::write(stats_dir.join("sender.log"), log.join("\n"));
     assert!(
         !log.iter().any(|l| l.contains("panic")),
         "srtla_send panicked in the {name} arm"
@@ -175,7 +190,7 @@ fn run_arm(rescue: bool, p: &Params) -> Value {
     let rx_packets = d(&rx, &before_rx, "recv", "packets");
     let rx_unique = d(&rx, &before_rx, "recv", "packetsUnique");
     json!({
-        "arm": if rescue { "rescue" } else { "baseline" },
+        "arm": arm,
         "silence_pulls": pulls,
         "rescue_events": events,
         "rescued_packets": resent,
@@ -207,10 +222,16 @@ fn test_blackout_rescue_ab() {
         blackout_ms: env_u64("BR_BLACKOUT_MS", 1_500),
         recover_ms: env_u64("BR_RECOVER_MS", 6_000),
         pps: env_u64("BR_PPS", 400) as u32,
+        pace: env_u64("BR_PACE", 1) as u32,
     };
-
-    let base = run_arm(false, &p);
-    let resc = run_arm(true, &p);
+    let arms: Vec<String> = std::env::var("BR_ARMS")
+        .unwrap_or_else(|_| "baseline,rescue,paced".into())
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| ["baseline", "rescue", "paced"].contains(&a.as_str()))
+        .collect();
+    assert!(!arms.is_empty(), "BR_ARMS names no known arm");
+    let results: Vec<(String, Value)> = arms.iter().map(|a| (a.clone(), run_arm(a, &p))).collect();
 
     let rows = [
         "silence_pulls",
@@ -227,34 +248,51 @@ fn test_blackout_rescue_ab() {
         "tx_dropped",
     ];
     eprintln!(
-        "\nblackout rescue A/B: latency {} ms, one-way delay {} ms, {} x {} ms blackouts, {} pkt/s",
-        p.latency_ms, p.delay_ms, p.cycles, p.blackout_ms, p.pps
+        "
+blackout rescue A/B: latency {} ms, one-way delay {} ms, {} x {} ms blackouts, {} pkt/s, pace {}",
+        p.latency_ms, p.delay_ms, p.cycles, p.blackout_ms, p.pps, p.pace
     );
-    eprintln!("{:<18} {:>10} {:>10}", "metric", "baseline", "rescue");
+    let mut head = format!("{:<18}", "metric");
+    for (a, _) in &results {
+        head += &format!(" {a:>10}");
+    }
+    eprintln!("{head}");
     for r in rows {
-        eprintln!("{:<18} {:>10} {:>10}", r, base[r], resc[r]);
+        let mut line = format!("{r:<18}");
+        for (_, v) in &results {
+            line += &format!(" {:>10}", v[r]);
+        }
+        eprintln!("{line}");
     }
 
-    let summary = json!({
+    let mut summary = json!({
         "params": {
             "latency_ms": p.latency_ms, "delay_ms": p.delay_ms, "cycles": p.cycles,
             "blackout_ms": p.blackout_ms, "recover_ms": p.recover_ms, "pps": p.pps,
+            "pace": p.pace,
         },
         "receiver": std::fs::read_to_string("/etc/srtla_rec_impl").unwrap_or_default().trim(),
-        "baseline": base,
-        "rescue": resc,
     });
-    let out = std::env::var("BR_SUMMARY")
-        .unwrap_or_else(|_| "/tmp/blackout_rescue_summary.json".into());
+    for (a, v) in &results {
+        summary[a] = v.clone();
+    }
+    let out =
+        std::env::var("BR_SUMMARY").unwrap_or_else(|_| "/tmp/blackout_rescue_summary.json".into());
     let _ = std::fs::write(&out, serde_json::to_string_pretty(&summary).unwrap());
 
-    assert_eq!(base["stats_ok"], true, "baseline arm produced no SRT stats");
-    assert_eq!(resc["stats_ok"], true, "rescue arm produced no SRT stats");
-    assert!(base["rx_unique"].as_i64().unwrap_or(0) > 0, "baseline delivered nothing");
-    assert!(resc["rx_unique"].as_i64().unwrap_or(0) > 0, "rescue arm delivered nothing");
-    assert_eq!(base["rescue_events"], 0, "rescue fired with the flag off");
-    assert!(
-        resc["rescue_events"].as_u64().unwrap_or(0) > 0,
-        "rescue never fired in the rescue arm"
-    );
+    for (a, v) in &results {
+        assert_eq!(v["stats_ok"], true, "{a} arm produced no SRT stats");
+        assert!(
+            v["rx_unique"].as_i64().unwrap_or(0) > 0,
+            "{a} arm delivered nothing"
+        );
+        if a == "baseline" {
+            assert_eq!(v["rescue_events"], 0, "rescue fired with the flag off");
+        } else {
+            assert!(
+                v["rescue_events"].as_u64().unwrap_or(0) > 0,
+                "rescue never fired in the {a} arm"
+            );
+        }
+    }
 }

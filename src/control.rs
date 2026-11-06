@@ -9,7 +9,7 @@
 //! - `set_mode { mode: "classic"|"enhanced" }`
 //! - `set_quality { enabled: bool }`
 //! - `set_stall_deselect { enabled: bool }`
-//! - `set_blackout_rescue { enabled: bool }`
+//! - `set_blackout_rescue { enabled: bool, pace?: u32 }`
 //! - `set_conn_timeout { ms: u64 }` (clamped; response echoes the applied value)
 //! - `get_status` → current `ConfigSnapshot`
 //! - `get_stats` → per-link telemetry
@@ -328,7 +328,10 @@ fn handle_method(
                 .and_then(Value::as_bool)
                 .ok_or_else(|| ErrorObject::new(INVALID_PARAMS, "expected params.enabled: bool"))?;
             config.set_blackout_rescue(enabled);
-            Ok(json!({ "enabled": enabled }))
+            if let Some(pace) = params.get("pace").and_then(Value::as_u64) {
+                config.set_blackout_rescue_pace(pace.min(u32::MAX as u64) as u32);
+            }
+            Ok(json!({ "enabled": enabled, "pace": config.snapshot().blackout_rescue_pace }))
         }
 
         "set_conn_timeout" => {
@@ -352,6 +355,7 @@ fn handle_method(
                 "quality_enabled": snap.quality_enabled,
                 "stall_deselect": snap.stall_deselect,
                 "blackout_rescue": snap.blackout_rescue,
+                "blackout_rescue_pace": snap.blackout_rescue_pace,
                 "stall_min_in_flight": snap.stall_min_in_flight,
                 "stall_ack_stale_ms": snap.stall_ack_stale_ms,
                 "conn_timeout_ms": snap.conn_timeout_ms,

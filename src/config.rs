@@ -43,6 +43,7 @@ pub struct DynamicConfig {
     /// [`DynamicConfig::set_negotiated_latency_ms`].
     negotiated_latency_ms: Arc<AtomicU32>,
     blackout_rescue: Arc<AtomicBool>,
+    blackout_rescue_pace: Arc<AtomicU32>,
 }
 
 impl Default for DynamicConfig {
@@ -63,6 +64,7 @@ impl DynamicConfig {
             rehome_on_failure: Arc::new(AtomicBool::new(true)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
             blackout_rescue: Arc::new(AtomicBool::new(false)),
+            blackout_rescue_pace: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -88,6 +90,7 @@ impl DynamicConfig {
             rehome_on_failure: Arc::new(AtomicBool::new(!no_rehome)),
             negotiated_latency_ms: Arc::new(AtomicU32::new(0)),
             blackout_rescue: Arc::new(AtomicBool::new(false)),
+            blackout_rescue_pace: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -113,6 +116,7 @@ impl DynamicConfig {
             conn_timeout_ms: self.conn_timeout_ms.load(Ordering::Relaxed),
             negotiated_latency_ms: self.negotiated_latency_ms.load(Ordering::Relaxed),
             blackout_rescue: self.blackout_rescue.load(Ordering::Relaxed),
+            blackout_rescue_pace: self.blackout_rescue_pace.load(Ordering::Relaxed),
         }
     }
 
@@ -151,6 +155,18 @@ impl DynamicConfig {
     pub fn with_blackout_rescue(self, enabled: bool) -> Self {
         self.set_blackout_rescue(enabled);
         self
+    }
+
+    /// Builder for the startup blackout-rescue pace (`--blackout-rescue-pace`).
+    pub fn with_blackout_rescue_pace(self, pace: u32) -> Self {
+        self.set_blackout_rescue_pace(pace);
+        self
+    }
+
+    /// Set blackout-rescue pacing at runtime: stranded packets resent per
+    /// routed data packet, `0` for all at once.
+    pub fn set_blackout_rescue_pace(&self, pace: u32) {
+        self.blackout_rescue_pace.store(pace, Ordering::Relaxed);
     }
 
     /// Toggle blackout rescue at runtime.

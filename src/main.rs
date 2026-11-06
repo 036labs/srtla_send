@@ -96,6 +96,12 @@ struct Cli {
     /// Requires the stall gate (`--no-stall-deselect` disables both).
     #[arg(long = "blackout-rescue")]
     blackout_rescue: bool,
+    /// Pace blackout rescue: resend at most this many stranded packets per
+    /// routed data packet (so 1 adds at most the stream's own rate on top of
+    /// it), instead of all at once. 0 (default) sends the rescue at once.
+    /// Stranded packets wait, oldest first, until their SRT deadline.
+    #[arg(long = "blackout-rescue-pace", default_value_t = 0)]
+    blackout_rescue_pace: u32,
     /// In-flight packet backlog at or above which a link becomes a stall
     /// candidate for `--no-stall-deselect`.
     #[arg(long = "stall-min-in-flight", default_value_t = config::STALL_MIN_IN_FLIGHT_PACKETS)]
@@ -164,6 +170,7 @@ impl Cli {
             no_quality,
             no_stall_deselect,
             blackout_rescue,
+            blackout_rescue_pace,
             stall_min_in_flight,
             stall_ack_stale_ms,
             conn_timeout_ms,
@@ -220,7 +227,8 @@ async fn main() -> Result<()> {
         args.conn_timeout_ms,
         args.no_rehome,
     )
-    .with_blackout_rescue(args.blackout_rescue);
+    .with_blackout_rescue(args.blackout_rescue)
+    .with_blackout_rescue_pace(args.blackout_rescue_pace);
 
     // Create shared stats for telemetry export
     let shared_stats = stats::SharedStats::new();
@@ -313,6 +321,7 @@ mod tests {
                 no_quality = true
                 no_stall_deselect = true
                 blackout_rescue = true
+                blackout_rescue_pace = 2
                 stall_min_in_flight = 64
                 stall_ack_stale_ms = 1500
                 conn_timeout_ms = 8000
@@ -322,6 +331,7 @@ mod tests {
         assert!(cli.no_quality);
         assert!(cli.no_stall_deselect);
         assert!(cli.blackout_rescue);
+        assert_eq!(cli.blackout_rescue_pace, 2);
         assert_eq!(cli.stall_min_in_flight, 64);
         assert_eq!(cli.stall_ack_stale_ms, 1500);
         assert_eq!(cli.conn_timeout_ms, 8000);

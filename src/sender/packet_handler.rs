@@ -568,22 +568,33 @@ async fn send_stall_probes(
 ///
 /// The stall gate arms a rescue on its rising edges (see
 /// `SrtlaConnection::request_rescue`); this runs right after selection, which
-/// is where the gate is evaluated, so a stranded packet is resent within the
-/// same packet event that pulled its link. Each copy keeps its SRT sequence
-/// number and gets the retransmit flag, like a duplicate probe: a receiver
-/// that already has it discards it, one that does not slots it in, and the
-/// flag keeps it out of an SRTLA receiver's reorder-hold estimator.
+/// is where the gate is evaluated. Arming moves the link's still-outstanding
+/// packets into its rescue outbox; every packet event then drains outboxes
+/// onto the healthy links, oldest first. With `blackout_rescue_pace` = 0 an
+/// outbox drains at once; with N it releases at most N packets per routed
+/// data packet, so a rescue adds at most N times the stream's own rate. A
+/// packet that waits past the SRT latency budget is dropped from the outbox.
+/// While no healthy link is free (the other links are gated too) the outbox
+/// simply waits for one.
 ///
-/// Unlike a probe, a rescued copy *is* the unique copy the receiver is now
-/// waiting for, so it is tracked like payload on the link that carries it: it
-/// is registered in-flight there, `seq_tracker` hands NAK ownership to that
-/// link, and it is recorded in that link's ring so a second blackout can
-/// rescue it again. The pulled link's own packet-log entries are left alone
-/// for the cumulative ACK to clear, so its stall accounting is unchanged.
+/// Each copy keeps its SRT sequence number and gets the retransmit flag, like
+/// a duplicate probe: a receiver that already has it discards it, one that
+/// does not slots it in, and the flag keeps it out of an SRTLA receiver's
+/// reorder-hold estimator. The copy is registered in-flight on the link that
+/// carries it and recorded in that link's ring, so a second blackout can
+/// rescue it again.
+///
+/// NAK ownership deliberately stays with the pulled link. The receiver keeps
+/// NAKing the sequences that link lost, and those NAKs arrive after the rescue;
+/// handing ownership to the carrying link made every one of them count as a
+/// loss there, cutting the window of the one link carrying the stream (seen
+/// in the A/B harness as a NAK burst and fast-recovery mode on the healthy
+/// link within a round trip of each rescue). Blamed on the pulled link they
+/// only cut a window that is gated anyway.
 ///
 /// Targets come from the normal selector, one packet at a time: it already
 /// skips gated links and counts queued packets against a link's score, so a
-/// rescue burst spreads over the survivors instead of landing on one.
+/// rescue spreads over the survivors instead of landing on one.
 async fn rescue_stalled_links(
     connections: &mut [SrtlaConnection],
     conn_io: &ConnIoMap,
@@ -591,52 +602,80 @@ async fn rescue_stalled_links(
     config_snap: &ConfigSnapshot,
     now_ms: u64,
 ) {
+    let max_age_ms = match config_snap.negotiated_latency_ms {
+        0 => srtla_core::connection::RESCUE_DEFAULT_MAX_AGE_MS,
+        ms => ms as u64,
+    };
+    let pace = config_snap.blackout_rescue_pace;
     for i in 0..connections.len() {
-        if !connections[i].rescue_pending() {
-            continue;
-        }
-        // Packets still in this link's batch queue are not in its packet log
-        // yet; flush them (into the hole) so they register and get rescued too.
-        if let Some(io) = conn_io.get(&connections[i].conn_id) {
-            flush_connection(&mut connections[i], &io.socket, seq_tracker, "pre-rescue flush")
+        if connections[i].rescue_pending() {
+            // Packets still in this link's batch queue are not in its packet
+            // log yet; flush them (into the hole) so they register and get
+            // rescued too.
+            if let Some(io) = conn_io.get(&connections[i].conn_id) {
+                flush_connection(
+                    &mut connections[i],
+                    &io.socket,
+                    seq_tracker,
+                    "pre-rescue flush",
+                )
                 .await;
+            }
+            let queued = connections[i].queue_rescue(now_ms, max_age_ms);
+            if queued > 0 {
+                debug!(
+                    "{}: blackout rescue queued {queued} stranded packets",
+                    connections[i].label
+                );
+            }
         }
-        let max_age_ms = match config_snap.negotiated_latency_ms {
-            0 => srtla_core::connection::RESCUE_DEFAULT_MAX_AGE_MS,
-            ms => ms as u64,
-        };
-        let stranded = connections[i].take_rescue(now_ms, max_age_ms);
-        if stranded.is_empty() {
+        if connections[i].rescue_outbox_len() == 0 {
             continue;
         }
-        let total = stranded.len();
+        if pace > 0 {
+            connections[i].add_rescue_credit(pace);
+        }
         let (mut sent, mut bytes) = (0u64, 0u64);
-        for (seq, data) in stranded {
+        while connections[i].rescue_outbox_len() > 0 {
             let Some(t) = select_connection_idx(connections, None, now_ms, config_snap) else {
                 break;
             };
             if t == i {
-                // The link un-gated mid-rescue (it spoke): its packets may yet
-                // arrive, and nothing better is available. Stop here.
+                // No other link can take it right now (or this one spoke and
+                // is schedulable again). Wait; the packet expires if this
+                // lasts past its deadline.
                 break;
             }
+            if pace > 0 && !connections[i].spend_rescue_credit() {
+                break;
+            }
+            let Some((seq, data)) = connections[i].pop_rescue(now_ms, max_age_ms) else {
+                break;
+            };
             let mut copy: SmallVec<u8, 1500> = SmallVec::from_slice_copy(&data);
             srtla_protocol::set_srt_data_retransmit(&mut copy);
             let target = &mut connections[t];
             let needs_flush = target.queue_data_packet(&copy, Some(seq), now_ms);
             target.record_for_rescue(seq, &copy, now_ms);
-            seq_tracker.insert(seq, target.conn_id, now_ms);
             if needs_flush && let Some(io) = conn_io.get(&target.conn_id) {
                 flush_connection(target, &io.socket, seq_tracker, "rescue batch flush").await;
             }
             sent += 1;
             bytes += copy.len() as u64;
         }
-        connections[i].note_rescued(sent, bytes);
-        info!(
-            "{}: blackout rescue resent {sent}/{total} stranded packets ({bytes} bytes) on healthy links",
-            connections[i].label
-        );
+        if sent > 0 {
+            connections[i].note_rescued(sent, bytes);
+        }
+        // An outbox blocked with no target still ages out, so a rescue that
+        // never found a healthy link ends (and is reported) on its own.
+        connections[i].drop_expired_rescue(now_ms, max_age_ms);
+        if let Some(t) = connections[i].finish_rescue() {
+            info!(
+                "{}: blackout rescue resent {}/{} stranded packets ({} bytes, {} expired) on \
+                 healthy links",
+                connections[i].label, t.sent, t.queued, t.bytes, t.expired
+            );
+        }
     }
 }
 
@@ -833,7 +872,8 @@ mod tests {
 
     /// Link 0 is loaded and goes silent; link 1 is healthy. The silence pull
     /// must arm a rescue, and the rescue must move every stranded packet onto
-    /// link 1 as a retransmit-flagged copy that link 1 now owns.
+    /// link 1 as a retransmit-flagged copy, while NAK ownership stays with
+    /// link 0.
     #[tokio::test]
     async fn silence_pull_rescues_stranded_packets_onto_the_healthy_link() {
         use srtla_core::config_snapshot::STALL_MIN_IN_FLIGHT_PACKETS;
@@ -858,7 +898,10 @@ mod tests {
 
         let sel = select_connection_idx(&mut connections, None, now, &config);
         assert_eq!(sel, Some(1));
-        assert!(connections[0].rescue_pending(), "the pull must arm a rescue");
+        assert!(
+            connections[0].rescue_pending(),
+            "the pull must arm a rescue"
+        );
 
         rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
 
@@ -868,16 +911,15 @@ mod tests {
         assert_eq!(connections[0].rescued_bytes(), n as u64 * 1316);
         assert_eq!(connections[0].rescue_ring_len(), 0);
         assert_eq!(
-            connections[0].in_flight_packets,
-            n as i32,
+            connections[0].in_flight_packets, n as i32,
             "the pulled link's own accounting is left for the cumulative ACK"
         );
-        let healthy_id = connections[1].conn_id;
+        let pulled_id = connections[0].conn_id;
         for seq in 1..=n {
             assert_eq!(
                 seq_tracker.get(seq, now),
-                Some(healthy_id),
-                "NAK ownership of a rescued packet moves to the carrying link"
+                Some(pulled_id),
+                "NAKs for a rescued packet stay blamed on the link that lost it"
             );
         }
 
@@ -885,7 +927,10 @@ mod tests {
         flush_all_batches(&mut connections, &conn_io, &mut seq_tracker).await;
         assert_eq!(connections[1].in_flight_packets, n as i32);
         assert_eq!(connections[1].rescue_ring_len(), n as usize);
-        let again = connections[1].take_rescue(now, 1_000);
+        // Read link 1's ring back through a rescue of its own.
+        connections[1].request_rescue();
+        assert_eq!(connections[1].queue_rescue(now, 1_000), n as usize);
+        let again: Vec<_> = std::iter::from_fn(|| connections[1].pop_rescue(now, 1_000)).collect();
         assert_eq!(again.len(), n as usize);
         for (seq, data) in &again {
             assert!(
@@ -920,6 +965,81 @@ mod tests {
 
         assert_eq!(connections[0].rescued_packets(), 0);
         assert!(!connections[0].has_queued_packets());
+    }
+
+    /// Paced: each packet event releases at most `pace` stranded packets, the
+    /// oldest first, until the outbox is empty.
+    #[tokio::test]
+    async fn paced_rescue_releases_pace_packets_per_event() {
+        use srtla_core::config_snapshot::STALL_MIN_IN_FLIGHT_PACKETS;
+
+        let mut connections = crate::test_helpers::create_test_connections(2).await;
+        let conn_io = crate::test_helpers::create_test_conn_io_map(&connections);
+        let mut seq_tracker = SequenceTracker::new();
+        let config = ConfigSnapshot {
+            blackout_rescue_pace: 3,
+            ..rescue_config()
+        };
+        let now = srtla_core::utils::now_ms();
+        let n = STALL_MIN_IN_FLIGHT_PACKETS as u32 + 8;
+        for seq in 1..=n {
+            connections[0].record_for_rescue(seq, &srt_data(seq), now - 100);
+            connections[0].register_packet(seq as i32, now - 100);
+        }
+        connections[0].last_ack_or_rtt_sample_ms = now;
+        connections[0].last_received = Some(now - 300);
+        connections[1].last_ack_or_rtt_sample_ms = now;
+        let _ = select_connection_idx(&mut connections, None, now, &config);
+
+        rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
+        assert_eq!(connections[0].rescued_packets(), 3);
+        assert_eq!(connections[0].rescue_outbox_len(), n as usize - 3);
+
+        let mut events = 1;
+        while connections[0].rescue_outbox_len() > 0 {
+            rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
+            events += 1;
+            assert!(events < 100);
+        }
+        assert_eq!(connections[0].rescued_packets(), n as u64);
+        assert_eq!(events, (n as usize).div_ceil(3));
+    }
+
+    /// With nowhere to send, the outbox waits for a healthy link rather than
+    /// dropping the rescue, and expires what passes its deadline meanwhile.
+    #[tokio::test]
+    async fn blocked_rescue_waits_then_expires() {
+        use srtla_core::config_snapshot::STALL_MIN_IN_FLIGHT_PACKETS;
+
+        let mut connections = crate::test_helpers::create_test_connections(1).await;
+        let conn_io = crate::test_helpers::create_test_conn_io_map(&connections);
+        let mut seq_tracker = SequenceTracker::new();
+        let config = rescue_config();
+        let now = srtla_core::utils::now_ms();
+        let n = STALL_MIN_IN_FLIGHT_PACKETS as u32;
+        for seq in 1..=n {
+            connections[0].record_for_rescue(seq, &srt_data(seq), now);
+            connections[0].register_packet(seq as i32, now);
+        }
+        connections[0].last_ack_or_rtt_sample_ms = now;
+        connections[0].last_received = Some(now - 300);
+        let _ = select_connection_idx(&mut connections, None, now, &config);
+
+        rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, now).await;
+        assert_eq!(
+            connections[0].rescue_outbox_len(),
+            n as usize,
+            "kept while blocked"
+        );
+
+        let later = now + srtla_core::connection::RESCUE_DEFAULT_MAX_AGE_MS + 1;
+        rescue_stalled_links(&mut connections, &conn_io, &mut seq_tracker, &config, later).await;
+        assert_eq!(
+            connections[0].rescue_outbox_len(),
+            0,
+            "expired past the budget"
+        );
+        assert_eq!(connections[0].rescued_packets(), 0);
     }
 
     /// Off by default: a packet event records nothing, so the gate has nothing

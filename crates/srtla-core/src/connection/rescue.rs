@@ -18,8 +18,6 @@
 
 use std::collections::VecDeque;
 
-use smallvec::SmallVec;
-
 use super::SrtlaConnection;
 use crate::seq::{seq_after, seq_normalize};
 
@@ -38,10 +36,15 @@ pub const RESCUE_RING_MAX_AGE_MS: u64 = 3_000;
 /// arrival anyway, so resending it only costs bandwidth.
 pub const RESCUE_DEFAULT_MAX_AGE_MS: u64 = 1_000;
 
-/// Most packets resent per rescue event. Keeps a stall on a heavily loaded link
-/// from dumping an unbounded burst onto the survivors; the oldest packets go
-/// first, being closest to their deadline.
+/// Most packets queued per rescue event. Keeps a stall on a heavily loaded
+/// link from queueing an unbounded resend onto the survivors; the oldest
+/// packets go first, being closest to their deadline.
 pub const RESCUE_MAX_PACKETS_PER_EVENT: usize = 512;
+
+/// Ceiling on banked pacing credit, so a link whose outbox sat blocked (no
+/// healthy target) does not release its whole backlog in one burst when a
+/// target appears.
+const RESCUE_MAX_CREDIT: u32 = 32;
 
 #[derive(Debug)]
 struct RescueEntry {
@@ -50,15 +53,28 @@ struct RescueEntry {
     data: Vec<u8>,
 }
 
-/// A packet handed back by [`SrtlaConnection::take_rescue`] for resending.
+/// A packet handed back by [`SrtlaConnection::pop_rescue`] for resending.
 pub type RescuePacket = (u32, Vec<u8>);
 
+/// Totals of the rescue currently draining, reported when its outbox empties.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RescueTally {
+    pub queued: u64,
+    pub sent: u64,
+    pub bytes: u64,
+    pub expired: u64,
+}
+
 /// Per-link rescue state: the ring of recent data packets, the pending-rescue
-/// trigger, and lifetime counters.
+/// trigger, the outbox of stranded packets waiting to be resent, pacing
+/// credit, and counters.
 #[derive(Debug, Default)]
 pub struct RescueRing {
     entries: VecDeque<RescueEntry>,
+    outbox: VecDeque<RescueEntry>,
     pending: bool,
+    credit: u32,
+    tally: RescueTally,
     events: u64,
     packets: u64,
     bytes: u64,
@@ -113,7 +129,10 @@ impl RescueRing {
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.outbox.clear();
         self.pending = false;
+        self.credit = 0;
+        self.tally = RescueTally::default();
     }
 }
 
@@ -129,7 +148,7 @@ impl SrtlaConnection {
     /// latch). A no-op while the ring is empty, which is always the case with
     /// blackout rescue disabled, so the flag never asks the shell for work it
     /// cannot do.
-    pub(crate) fn request_rescue(&mut self) {
+    pub fn request_rescue(&mut self) {
         if !self.rescue.is_empty() {
             self.rescue.pending = true;
         }
@@ -141,40 +160,109 @@ impl SrtlaConnection {
         self.rescue.pending
     }
 
-    /// Disarm the rescue and hand back this link's stranded packets, oldest
-    /// first: those still outstanding in the packet log (not acknowledged, not
-    /// NAKed) and younger than `max_age_ms`, at most
-    /// [`RESCUE_MAX_PACKETS_PER_EVENT`] of them.
+    /// Disarm the rescue and move this link's stranded packets into its outbox,
+    /// oldest first: those still outstanding in the packet log (not
+    /// acknowledged, not NAKed) and younger than `max_age_ms`, at most
+    /// [`RESCUE_MAX_PACKETS_PER_EVENT`] in the outbox. Returns how many were
+    /// queued.
     ///
-    /// Drains the whole ring: rescued packets move to the links that carry the
+    /// Drains the whole ring: queued packets move to the links that carry the
     /// copies (the shell records them there), and the rest are either already
     /// delivered or too old to help. Packets still sitting in this link's batch
     /// queue are not in the packet log yet, so the shell flushes the queue
     /// before calling this.
-    pub fn take_rescue(&mut self, now_ms: u64, max_age_ms: u64) -> SmallVec<RescuePacket, 64> {
+    pub fn queue_rescue(&mut self, now_ms: u64, max_age_ms: u64) -> usize {
         self.rescue.pending = false;
         let cutoff = now_ms.saturating_sub(max_age_ms);
-        let mut out: SmallVec<RescuePacket, 64> = SmallVec::new();
+        let room = RESCUE_MAX_PACKETS_PER_EVENT.saturating_sub(self.rescue.outbox.len());
         let packet_log = &self.packet_log;
+        let mut queued = 0;
         for e in self.rescue.entries.drain(..) {
-            if out.len() >= RESCUE_MAX_PACKETS_PER_EVENT {
+            if queued >= room {
                 break;
             }
             if e.sent_ms >= cutoff && packet_log.contains_key(&e.seq) {
-                out.push((e.seq as u32, e.data));
+                self.rescue.outbox.push_back(e);
+                queued += 1;
             }
         }
-        // `drain(..)` dropped on break empties the rest as well.
-        if !out.is_empty() {
+        if queued > 0 {
             self.rescue.events += 1;
+            self.rescue.tally.queued += queued as u64;
         }
-        out
+        queued
+    }
+
+    /// Packets waiting in this link's rescue outbox.
+    #[inline(always)]
+    pub fn rescue_outbox_len(&self) -> usize {
+        self.rescue.outbox.len()
+    }
+
+    /// Pacing: grant `packets` more resends to this link's outbox (one routed
+    /// data packet's worth of pace), banked up to a small ceiling.
+    pub fn add_rescue_credit(&mut self, packets: u32) {
+        self.rescue.credit = self
+            .rescue
+            .credit
+            .saturating_add(packets)
+            .min(RESCUE_MAX_CREDIT);
+    }
+
+    /// Pacing: spend one resend of credit, if any is banked.
+    pub fn spend_rescue_credit(&mut self) -> bool {
+        if self.rescue.credit == 0 {
+            return false;
+        }
+        self.rescue.credit -= 1;
+        true
+    }
+
+    /// Next stranded packet to resend, oldest first, skipping (and counting)
+    /// any that aged past `max_age_ms` while they waited.
+    pub fn pop_rescue(&mut self, now_ms: u64, max_age_ms: u64) -> Option<RescuePacket> {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        while let Some(e) = self.rescue.outbox.pop_front() {
+            if e.sent_ms >= cutoff {
+                return Some((e.seq as u32, e.data));
+            }
+            self.rescue.tally.expired += 1;
+        }
+        None
+    }
+
+    /// Drop (and count) packets at the front of the outbox that aged past
+    /// `max_age_ms`, without taking a live one.
+    pub fn drop_expired_rescue(&mut self, now_ms: u64, max_age_ms: u64) {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        while self
+            .rescue
+            .outbox
+            .front()
+            .is_some_and(|e| e.sent_ms < cutoff)
+        {
+            self.rescue.outbox.pop_front();
+            self.rescue.tally.expired += 1;
+        }
+    }
+
+    /// Hand back the tally of the rescue that just drained, once the outbox is
+    /// empty, and start a fresh one. `None` while packets are still waiting or
+    /// nothing was queued.
+    pub fn finish_rescue(&mut self) -> Option<RescueTally> {
+        if !self.rescue.outbox.is_empty() || self.rescue.tally.queued == 0 {
+            return None;
+        }
+        self.rescue.credit = 0;
+        Some(std::mem::take(&mut self.rescue.tally))
     }
 
     /// Count packets the shell actually resent for this link.
     pub fn note_rescued(&mut self, packets: u64, bytes: u64) {
         self.rescue.packets += packets;
         self.rescue.bytes += bytes;
+        self.rescue.tally.sent += packets;
+        self.rescue.tally.bytes += bytes;
     }
 
     /// Cumulative rescue events (rescues that found stranded packets).
@@ -248,8 +336,12 @@ mod tests {
         assert_eq!(left, vec![1, 2]);
     }
 
+    fn drain(c: &mut SrtlaConnection, now: u64, max_age: u64) -> Vec<RescuePacket> {
+        std::iter::from_fn(|| c.pop_rescue(now, max_age)).collect()
+    }
+
     #[tokio::test]
-    async fn take_returns_only_outstanding_young_packets_in_send_order() {
+    async fn queue_keeps_only_outstanding_young_packets_in_send_order() {
         let mut c = create_test_connection().await;
         for seq in 10u32..15 {
             c.record_for_rescue(seq, &[seq as u8; 4], 5_000);
@@ -262,13 +354,16 @@ mod tests {
         c.request_rescue();
         assert!(c.rescue_pending());
 
-        let got = c.take_rescue(5_500, 1_000);
-        let seqs: Vec<u32> = got.iter().map(|(s, _)| *s).collect();
-        assert_eq!(seqs, vec![11, 13, 14]);
-        assert_eq!(got[0].1, vec![11u8; 4]);
+        assert_eq!(c.queue_rescue(5_500, 1_000), 3);
         assert!(!c.rescue_pending());
         assert_eq!(c.rescue_events(), 1);
         assert_eq!(c.rescue_ring_len(), 0, "the ring is drained by a rescue");
+        assert_eq!(c.rescue_outbox_len(), 3);
+
+        let got = drain(&mut c, 5_500, 1_000);
+        let seqs: Vec<u32> = got.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![11, 13, 14]);
+        assert_eq!(got[0].1, vec![11u8; 4]);
     }
 
     #[tokio::test]
@@ -279,15 +374,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_is_capped_per_event() {
+    async fn queue_is_capped_per_event() {
         let mut c = create_test_connection().await;
         for seq in 0..(RESCUE_MAX_PACKETS_PER_EVENT as u32 + 50) {
             c.record_for_rescue(seq, &[0], 5_000);
             c.register_packet(seq as i32, 5_000);
         }
-        let got = c.take_rescue(5_000, 1_000);
-        assert_eq!(got.len(), RESCUE_MAX_PACKETS_PER_EVENT);
-        assert_eq!(got[0].0, 0, "oldest first");
+        assert_eq!(c.queue_rescue(5_000, 1_000), RESCUE_MAX_PACKETS_PER_EVENT);
+        assert_eq!(drain(&mut c, 5_000, 1_000)[0].0, 0, "oldest first");
+    }
+
+    #[tokio::test]
+    async fn packets_that_age_out_while_waiting_are_skipped_and_counted() {
+        let mut c = create_test_connection().await;
+        c.record_for_rescue(1, &[0], 1_000);
+        c.record_for_rescue(2, &[0], 1_400);
+        c.register_packet(1, 1_000);
+        c.register_packet(2, 1_400);
+        assert_eq!(c.queue_rescue(1_500, 1_000), 2);
+        // Held up (no healthy target) until seq 1 is past the budget.
+        let got = drain(&mut c, 2_200, 1_000);
+        assert_eq!(got.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![2]);
+        c.note_rescued(1, 1);
+        let t = c.finish_rescue().expect("outbox drained");
+        assert_eq!((t.queued, t.sent, t.expired), (2, 1, 1));
+        assert!(c.finish_rescue().is_none(), "a tally is reported once");
+    }
+
+    #[tokio::test]
+    async fn pacing_credit_is_spent_one_resend_at_a_time_and_capped() {
+        let mut c = create_test_connection().await;
+        assert!(!c.spend_rescue_credit());
+        c.add_rescue_credit(2);
+        assert!(c.spend_rescue_credit());
+        assert!(c.spend_rescue_credit());
+        assert!(!c.spend_rescue_credit());
+        c.add_rescue_credit(u32::MAX);
+        let banked = std::iter::from_fn(|| c.spend_rescue_credit().then_some(())).count();
+        assert_eq!(banked, RESCUE_MAX_CREDIT as usize);
     }
 
     #[tokio::test]

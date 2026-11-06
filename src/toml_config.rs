@@ -20,6 +20,7 @@ pub struct TomlConfig {
     pub no_quality: Option<bool>,
     pub no_stall_deselect: Option<bool>,
     pub blackout_rescue: Option<bool>,
+    pub blackout_rescue_pace: Option<u32>,
     pub stall_min_in_flight: Option<i32>,
     pub stall_ack_stale_ms: Option<u64>,
     pub conn_timeout_ms: Option<u64>,
