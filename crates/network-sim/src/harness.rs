@@ -844,9 +844,55 @@ pub fn wait_for_uplink_sockets(
 // SrtlaTestStack
 // ---------------------------------------------------------------------------
 
+/// SRT endpoint settings for a test stack.
+///
+/// The defaults reproduce the stack's long-standing behaviour: a 2 s latency on
+/// both ends (above the TBF buffer depth, see [`SrtlaTestStack::start_srt_caller`])
+/// and no stats files. Measurement tests lower the latency to make SRT's own
+/// recovery race the deadline, and ask both ends for cumulative JSON stats.
+#[derive(Debug, Clone)]
+pub struct SrtOptions {
+    /// SRT latency (TSBPD delay) in ms, set on both the listener and the caller.
+    pub latency_ms: u32,
+    /// Directory for `srt-live-transmit` stats: the listener writes
+    /// `rx.json`, the caller `tx.json`, one cumulative JSON object per line.
+    pub stats_dir: Option<PathBuf>,
+}
+
+impl Default for SrtOptions {
+    fn default() -> Self {
+        Self {
+            latency_ms: 2000,
+            stats_dir: None,
+        }
+    }
+}
+
+/// `srt-live-transmit` flags that write cumulative JSON stats to `path`
+/// every 100 packets.
+fn srt_stats_args(path: &Path) -> Vec<String> {
+    vec![
+        "-s:100".into(),
+        "-pf:json".into(),
+        "-f".into(),
+        format!("-statsout:{}", path.display()),
+    ]
+}
+
+/// Last complete JSON object in an `srt-live-transmit` stats file: the
+/// cumulative totals as of the final report. `None` if the file is missing or
+/// holds no complete line (a process killed mid-write leaves a partial tail).
+pub fn read_srt_stats(path: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+}
+
 /// Full 3-process SRTLA test stack: srt-live-transmit + srtla_rec + srtla_send.
 pub struct SrtlaTestStack {
     pub topo: SrtlaTestTopology,
+    srt_options: SrtOptions,
     srt_server: Option<NamespaceProcess>,
     srtla_rec: Option<NamespaceProcess>,
     srtla_send: Option<NamespaceProcess>,
@@ -905,20 +951,42 @@ impl SrtlaTestStack {
     ///
     /// `sender_extra_args` are appended to the srtla_send command line.
     pub fn start(test_name: &str, num_links: usize, sender_extra_args: &[&str]) -> Result<Self> {
+        Self::start_with_srt(test_name, num_links, sender_extra_args, SrtOptions::default())
+    }
+
+    /// [`Self::start`] with explicit SRT endpoint settings. The options also
+    /// apply to a caller started later with [`Self::start_srt_caller`].
+    pub fn start_with_srt(
+        test_name: &str,
+        num_links: usize,
+        sender_extra_args: &[&str],
+        srt_options: SrtOptions,
+    ) -> Result<Self> {
         let topo = SrtlaTestTopology::new(test_name, num_links)?;
         let ip_list_path = topo.write_ip_list()?;
+        if let Some(dir) = &srt_options.stats_dir {
+            std::fs::create_dir_all(dir).context("create SRT stats dir")?;
+            for f in ["rx.json", "tx.json"] {
+                let _ = std::fs::remove_file(dir.join(f));
+            }
+        }
 
         // 1. Start srt-live-transmit in receiver NS
         //    Acts as an SRT listener that sinks to /dev/null.
-        let srt_uri = format!("srt://:{}?mode=listener", SRT_SERVER_PORT);
+        let srt_uri = format!(
+            "srt://:{}?mode=listener&latency={}",
+            SRT_SERVER_PORT, srt_options.latency_ms
+        );
         // Sink to a UDP port — srt-live-transmit only supports srt://, udp://, file://con
         let sink_uri = "udp://127.0.0.1:9999";
-        let mut srt_server = NamespaceProcess::spawn(
-            &topo.receiver_ns,
-            "srt-live-transmit",
-            &[&srt_uri, sink_uri],
-        )
-        .context("start srt-live-transmit")?;
+        let mut server_args = vec![srt_uri, sink_uri.to_string()];
+        if let Some(dir) = &srt_options.stats_dir {
+            server_args.extend(srt_stats_args(&dir.join("rx.json")));
+        }
+        let server_args: Vec<&str> = server_args.iter().map(String::as_str).collect();
+        let mut srt_server =
+            NamespaceProcess::spawn(&topo.receiver_ns, "srt-live-transmit", &server_args)
+                .context("start srt-live-transmit")?;
 
         // Brief pause for listener setup, then check it's alive
         std::thread::sleep(Duration::from_millis(500));
@@ -980,6 +1048,7 @@ impl SrtlaTestStack {
 
         Ok(Self {
             topo,
+            srt_options,
             srt_server: Some(srt_server),
             srtla_rec: Some(srtla_rec),
             srtla_send: Some(srtla_send),
@@ -1018,13 +1087,21 @@ impl SrtlaTestStack {
         // in flight — a false-loss storm that doubles offered load and
         // tips a busy bond into congestion collapse. 2s clears the 1s
         // buffer with margin.
-        let out_uri = format!("srt://127.0.0.1:{SRTLA_SEND_SRT_PORT}?mode=caller&latency=2000");
-        let mut caller = NamespaceProcess::spawn(
-            &self.topo.sender_ns,
-            "srt-live-transmit",
-            &[&in_uri, &out_uri],
-        )
-        .context("start srt-live-transmit caller")?;
+        //
+        // That is the default; a test that sets a lower latency through
+        // [`SrtOptions`] must keep the links unshaped (or shaped shallower).
+        let out_uri = format!(
+            "srt://127.0.0.1:{SRTLA_SEND_SRT_PORT}?mode=caller&latency={}",
+            self.srt_options.latency_ms
+        );
+        let mut caller_args = vec![in_uri, out_uri];
+        if let Some(dir) = &self.srt_options.stats_dir {
+            caller_args.extend(srt_stats_args(&dir.join("tx.json")));
+        }
+        let caller_args: Vec<&str> = caller_args.iter().map(String::as_str).collect();
+        let mut caller =
+            NamespaceProcess::spawn(&self.topo.sender_ns, "srt-live-transmit", &caller_args)
+                .context("start srt-live-transmit caller")?;
 
         std::thread::sleep(Duration::from_millis(750));
         if let Some((code, stderr)) = caller.check_exit() {
@@ -1176,6 +1253,18 @@ impl SrtlaTestStack {
                 })
             })
             .sum()
+    }
+
+    /// Cumulative SRT stats of the listener (receiver side) so far, if
+    /// [`SrtOptions::stats_dir`] was set.
+    pub fn receiver_srt_stats(&self) -> Option<serde_json::Value> {
+        read_srt_stats(&self.srt_options.stats_dir.as_ref()?.join("rx.json"))
+    }
+
+    /// Cumulative SRT stats of the caller (sender side) so far, if
+    /// [`SrtOptions::stats_dir`] was set and a caller was started.
+    pub fn caller_srt_stats(&self) -> Option<serde_json::Value> {
+        read_srt_stats(&self.srt_options.stats_dir.as_ref()?.join("tx.json"))
     }
 
     /// Stop all processes and collect their output.
